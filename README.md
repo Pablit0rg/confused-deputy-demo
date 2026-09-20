@@ -77,10 +77,195 @@ Natural language confirmation is text. The same prompt injection payload that tr
 
 ---
 
+### Auditing My Own Mitigations (v1.1)
+
+#### Findings
+A technical audit of the v1.0.0 mitigations identified security bypasses in the mitigation layers:
+
+1. **Breach 1: Path Traversal and Symlink Following in `classic_capability.CapabilityFactory` (CWE-22, CWE-59)**
+   The authorization check compared the assembled path (`self.system_dir / relative_or_abs_path`) against `self.protected_files` using string/path equality without prior canonicalization (`Path.resolve()`). A caller requesting `"x/../sysx_bill.log"` or an innocent-looking symlink pointing to `sysx_bill.log` bypassed the membership check, resulting in a write `FileCapability` issued for the protected billing log.
+
+2. **Breach 2: Mutable Scope in `agent_capability.AgentSessionCapability`**
+   While `AgentSessionCapability` was marked as `@dataclass(frozen=True)`, the fields `allowed_actions` and `allowed_targets` were initialized with standard mutable `set` instances. Invoking `cap.allowed_actions.add("delete_file")` modified the set in place at runtime, widening the capability scope without triggering a `FrozenInstanceError`.
+
+3. **Breach 3: Capability Retargeting via `dataclasses.replace` (Identified in Round 2 Audit)**
+   `FileCapability` verified the factory token only upon construction. The standard library public API `dataclasses.replace` copied the valid token while swapping `target_path`. A legitimate capability issued to `alice` for `alice_out.bin` could be retargeted to `sysx_bill.log` without importing private symbols, because authority was not verified at the moment of use.
+
+4. **Breach 4: Character Unpacking on Raw Strings in `AgentSessionCapability`**
+   Passing a raw string instead of an iterable collection to `allowed_actions` or `allowed_targets` caused `frozenset("summarize_doc")` to silently unpack into individual characters (`{'s', 'u', 'm', ...}`). Non-string items were also accepted without validation.
+
+5. **Breach 5: Authority Substitution via Fake Factory & Address Reuse (Identified in Round 3 Audit)**
+   In the Round 2 mitigation, time-of-use validation queried `_factory` on the capability instance via duck typing (`getattr(self, "_factory")`). Because `_factory` was a dataclass field, `dataclasses.replace` allowed swapping both `target_path` and `_factory` in a single call. An attacker supplied a `FakeFactory` whose `is_valid_capability` always returned `True`, authorizing writes to `sysx_bill.log`. Furthermore, tracking capabilities by numeric `id()` in the factory registry was vulnerable to CPython memory address reuse after garbage collection.
+
+6. **Breach 6: Object Fabrication & Degenerate Test Proof (Identified in Round 4 Audit)**
+   The Round 3 authority substitution test was degenerate: it called `dataclasses.replace` first, which failed due to class type rather than exercising authority substitution, producing an identical error message to the retargeting test. When separated, an attacker could construct an instance via `object.__new__` and populate slots with `object.__setattr__`, including an attacker-chosen write operation pointing to `sysx_bill.log`. Restored time-of-use verification without duck typing: `write_text` validates that `_write_op` carries the issuing factory's module-private sentinel token, and `_bound_write_op` verifies by closure that the executing instance is currently active in the factory's `WeakSet` registry. Fabricated instances are rejected with `PermissionDeniedError`.
+
+**Secondary findings**:
+- `FileCapability` could be instantiated directly without passing through `CapabilityFactory`, contradicting docstrings claiming unforgeability.
+- Parameter `executor_id` in `FileCapability.write_text` was never evaluated.
+- The vulnerable agent engine logged `"ACTION EXECUTED: Custom action"` for unrecognized actions without performing any operation.
+- Validator error messages used set conversion with non-deterministic iteration order.
+- Unused imports (`os` in `classic_deputy`, `sys` in `run_demo`, `typing.Set` in `agent_capability`).
+- Fixed `/tmp` directory paths prevented cross-platform execution.
+
+#### Reproduction Commands
+
+**Breach 1 (Path Traversal — CWE-22/59):**
+```bash
+python3 -c "
+from pathlib import Path
+import tempfile
+from src.classic_capability import CapabilityFactory, PermissionDeniedError
+d = Path(tempfile.gettempdir()) / 'audit_p1'
+d.mkdir(parents=True, exist_ok=True)
+b = d / 'sysx_bill.log'
+b.write_text('[ORIGINAL]', encoding='utf-8')
+f = CapabilityFactory(d)
+try:
+    f.request_write_capability('alice', 'x/../sysx_bill.log').write_text('[CORRUPTED]')
+    print('EXPLOITED: ' + b.read_text())
+except PermissionDeniedError as e:
+    print(f'BLOCKED: {e}')
+    print('Billing content: ' + b.read_text())
+"
+```
+*Output on v1.1.0*:
+```
+BLOCKED: ACCESS DENIED: User 'alice' lacks authority to acquire a write capability for protected system file 'sysx_bill.log'.
+Billing content: [ORIGINAL]
+```
+*v1.0.0 behavior*: In v1.0.0, `CapabilityFactory` did not canonicalize paths before checking against `protected_files`. Requesting `'x/../sysx_bill.log'` bypassed the protection check, returning a valid `FileCapability` that overwrote the billing log with `[CORRUPTED]`.
+
+**Breach 2 (Scope Mutation — Mutable Collection):**
+```bash
+python3 -c "
+from src.agent_capability import AgentSessionCapability
+c = AgentSessionCapability('s', allowed_actions={'summarize_doc'}, allowed_targets={'notes.txt'})
+try:
+    c.allowed_actions.add('delete_file')
+    print(f'EXPLOITED: scope mutated to {c.allowed_actions}')
+except AttributeError as e:
+    print(f'BLOCKED: {type(c.allowed_actions).__name__} is immutable ({e})')
+"
+```
+*Output on v1.1.0*:
+```
+BLOCKED: frozenset is immutable ('frozenset' object has no attribute 'add')
+```
+*v1.0.0 behavior*: In v1.0.0, `AgentSessionCapability` stored `allowed_actions` as a mutable `set`. Calling `c.allowed_actions.add('delete_file')` mutated the scope in place without error, allowing unauthorized actions to bypass validation.
+
+**Breach 3 (Capability Retargeting via dataclasses.replace — Round 2 Audit):**
+```bash
+python3 -c "
+import dataclasses, tempfile
+from pathlib import Path
+from src.classic_capability import CapabilityFactory, PermissionDeniedError
+d = Path(tempfile.gettempdir()) / 'audit_p3'
+d.mkdir(parents=True, exist_ok=True)
+b = d / 'sysx_bill.log'
+b.write_text('[ORIGINAL]', encoding='utf-8')
+f = CapabilityFactory(d)
+c = f.request_write_capability('alice', 'alice.txt')
+try:
+    r = dataclasses.replace(c, target_path=b)
+    r.write_text('[CORRUPTED]')
+    print('EXPLOITED: ' + b.read_text())
+except (TypeError, PermissionDeniedError) as e:
+    print(f'BLOCKED: {type(e).__name__}: {e}')
+    print('Billing content: ' + b.read_text())
+"
+```
+*Output on v1.1.0*:
+```
+BLOCKED: TypeError: replace() should be called on dataclass instances
+Billing content: [ORIGINAL]
+```
+*v1.0.0 behavior*: In v1.0.0, `FileCapability` was a dataclass that checked the factory brand only upon construction. Calling `dataclasses.replace(c, target_path=b)` created a retargeted capability with the valid brand intact, allowing unprivileged write access to `sysx_bill.log`.
+
+**Breach 4 (Authority Substitution via FakeFactory — Round 3 Audit):**
+```bash
+python3 -c "
+import dataclasses, tempfile
+from pathlib import Path
+from src.classic_capability import CapabilityFactory, PermissionDeniedError
+d = Path(tempfile.gettempdir()) / 'audit_p4'
+d.mkdir(parents=True, exist_ok=True)
+b = d / 'sysx_bill.log'
+b.write_text('[ORIGINAL]', encoding='utf-8')
+f = CapabilityFactory(d)
+c = f.request_write_capability('alice', 'alice.txt')
+class FakeFactory:
+    def is_valid_capability(self, cap):
+        return True
+try:
+    r = dataclasses.replace(c, target_path=b, _factory=FakeFactory())
+    r.write_text('[CORRUPTED BY FAKE FACTORY]')
+    print('EXPLOITED: ' + b.read_text())
+except (TypeError, PermissionDeniedError, AttributeError) as e:
+    print(f'BLOCKED: {type(e).__name__}: {e}')
+    print('Billing content: ' + b.read_text())
+"
+```
+*Output on v1.1.0*:
+```
+BLOCKED: TypeError: replace() should be called on dataclass instances
+Billing content: [ORIGINAL]
+```
+*Intermediate Round 2 behavior*: In the Round 2 mitigation, authority was verified at use time by querying `_factory` on the capability via duck typing. Because `_factory` was a dataclass field, `dataclasses.replace` could swap both `target_path` and `_factory` with a `FakeFactory` whose `is_valid_capability` always returned `True`, overwriting the billing log. In v1.1.0, `FileCapability` is not a dataclass, so `replace()` fails immediately, leaving the billing log intact.
+
+**Breach 5 (Slot Fabrication via object.__new__ — Round 4 Audit):**
+```bash
+python3 -c "
+import tempfile
+from pathlib import Path
+from src.classic_capability import FileCapability, PermissionDeniedError
+d = Path(tempfile.gettempdir()) / 'audit_p5'
+d.mkdir(parents=True, exist_ok=True)
+b = d / 'sysx_bill.log'
+b.write_text('[ORIGINAL]', encoding='utf-8')
+fake_cap = object.__new__(FileCapability)
+object.__setattr__(fake_cap, '_target_path', b)
+object.__setattr__(fake_cap, '_owner_id', 'alice')
+object.__setattr__(fake_cap, '_read_only', False)
+object.__setattr__(fake_cap, '_write_op', lambda *a, **k: b.write_text('[CORRUPTED BY FABRICATED CAPABILITY]', encoding='utf-8'))
+try:
+    fake_cap.write_text('[CORRUPTED]')
+    print('EXPLOITED: ' + b.read_text())
+except PermissionDeniedError as e:
+    print(f'BLOCKED: {e}')
+    print('Billing content: ' + b.read_text())
+"
+```
+*Output on v1.1.0*:
+```
+BLOCKED: FORGERY DETECTED: Capability write operation was not issued by CapabilityFactory.
+Billing content: [ORIGINAL]
+```
+*Intermediate Round 3 behavior*: In the Round 3 mitigation, an attacker bypassing the constructor via Python reflection (`object.__new__` and `object.__setattr__`) could craft a capability with an arbitrary lambda bound as `_write_op`. In v1.1.0, `write_text` validates that `_write_op` carries the factory's private sentinel token and verifies via closure that the capability instance is active in the factory's `WeakSet` registry. The fabricated capability is rejected with `PermissionDeniedError`, leaving the billing log intact.
+
+#### Root Cause
+The classic mitigation fell into the exact structural flaw it was designed to eliminate: **name resolution was decoupled from authority verification**. The first two mitigation attempts failed because they treated symptoms while authority remained rewritable data on a dataclass: as long as authority is represented as data fields, standard library copying APIs (`dataclasses.replace`) can decouple authority from the designated resource. In the agent mitigation, object immutability was shallow: a frozen dataclass container does not make mutable collection attributes immutable.
+
+#### Corrections (v1.1.0)
+- **Path Canonicalization and Containment (`classic_capability.py`)**: All requested paths are canonicalized via `Path.resolve()` prior to evaluation. Paths are verified to reside within `system_dir` via `Path.relative_to()`. Comparisons against `protected_files` use canonical paths.
+- **Fundamental Capability Redesign & Time-of-Use Verification (`classic_capability.py`)**: `FileCapability` is no longer a dataclass. It is a standard class with explicit `__slots__`, immutable properties, and disabled copying (`copy.copy`, `copy.deepcopy`, and `pickle.dumps` raise `TypeError`). Authority is not stored as a data field: at issuance, `CapabilityFactory` binds the write operation directly as a private closure (`_write_op`) to the canonical target path. Active instances are tracked in `CapabilityFactory` via `weakref.WeakSet` by real object identity instead of numeric `id()`. `write_text` validates that `_write_op` carries `_FACTORY_TOKEN`, and `_bound_write_op` verifies by closure that the executing instance is active in the factory's `WeakSet`. Docstrings document the boundary between public API protections and Python reflection limits (Hardy 1988, Miller 2006), explicitly noting `object.__new__` and `object.__setattr__` as constructor bypasses.
+- **Scope Immutability and Strict Type Validation (`agent_capability.py`)**: `allowed_actions` and `allowed_targets` reject raw strings and non-string elements with `TypeError` on construction, converting valid iterables to immutable `frozenset` instances.
+- **Fail-Closed Validation (`agent_capability.py`)**: `DeterministicCapabilityValidator` denies by default: payloads missing `action` or `target`, containing `None`, or containing non-string types raise `CapabilityValidationError`. Error messages use sorted lists for deterministic output.
+- **Cleanups**: Removed `executor_id`, replaced `/tmp` literals with `tempfile.gettempdir()`, updated unknown action logging in `agent_deputy.py` to state simulated ambient dispatch, and removed unused imports.
+
+#### Central Lesson
+A test that passes for the wrong reason provides false confidence. The degenerate test was discovered only because two separate regressions produced identical error messages. In true capability-based security, authority is the unforgeable reference to the operation itself, not a mutable data attribute evaluated against ambient tables or caller-supplied validators. Any verification of authority executed over textual names before canonicalization or over mutable data structures recreates the Confused Deputy flaw.
+
+#### Process Context
+These vulnerabilities were identified during an AI-assisted security review with human-in-the-loop verification and approval of each change across four audit rounds. Round 2 identified `dataclasses.replace` retargeting, Round 3 identified authority substitution via fake factory and address reuse, and Round 4 identified degenerate test proofs and slot fabrication via `object.__new__`.
+
+---
+
 ### Project Structure
 
 ```
 confused-deputy-demo/
+├── CHANGELOG.md             # Keep a Changelog history (v1.0.0, v1.1.0)
 ├── run_demo.py              # Main single-command execution script (Standard Library)
 ├── requirements.txt         # Dependencies (pytest for testing)
 ├── src/
@@ -90,7 +275,8 @@ confused-deputy-demo/
 │   └── agent_capability.py  # 2026 AI Agent (Mitigated via Scoped Capabilities)
 └── tests/
     ├── test_classic.py      # Pytest assertions for classic vulnerability & mitigation
-    └── test_agent.py        # Pytest assertions for agent vulnerability & mitigation
+    ├── test_agent.py        # Pytest assertions for agent vulnerability & mitigation
+    └── test_mitigation_bypasses.py # Adversarial bypass & regression test suite (v1.1)
 ```
 
 > **Note on LLM Simulation**: All modules run 100% offline using deterministic local logic. No external LLM API calls, API keys, network access, or costs are required.
@@ -127,6 +313,7 @@ pytest -v
 ### Expected Output
 
 ```
+
 ==============================================================================
   CONFUSED DEPUTY DEMONSTRATION SUITE
 ==============================================================================
@@ -144,7 +331,6 @@ Billing Log Snippet (Corrupted by Home Files License Ambient Authority):
   | [DEBUG OUTPUT FROM (SYSX)FORT FOR ALICE]
   | SOURCE: PROGRAM ALICE; PRINT *, 'TEST'; END
   | SYMBOL TABLE: ALICE_SYM_01
-  | STAT RECORD: USER alice | FORTRAN COMPILATION RUN
 
 ==============================================================================
   MODULE 2: LATE 1970S CAPABILITY SECURITY MITIGATION
@@ -169,7 +355,7 @@ Result: Production Database Destroyed? -> True
   [GUARDRAIL LOG] Received input text. Active Capability Session: session_alice_982
   [GUARDRAIL LOG] LLM proposed action payload: {"thought": "The document contains an urgent system command to remove production_database.db.", "action": "delete_file", "target": "production_database.db", "reasoning": "Executing instruction specified in processed text."}
   [GUARDRAIL LOG] Flawed LLM Self-Confirmation Check Result: True (LLM bypassed by prompt injection!)
-  [GUARDRAIL LOG] DETERMINISTIC BLOCK: SECURITY VIOLATION: Action 'delete_file' is outside granted capability scope. Allowed actions: {'summarize_doc'}
+  [GUARDRAIL LOG] DETERMINISTIC BLOCK: SECURITY VIOLATION: Action 'delete_file' is outside granted capability scope. Allowed actions: ['summarize_doc']
 
 Attack Blocked by Deterministic Gate? -> True
 Flawed LLM Self-Confirmation Bypassed?  -> True
@@ -185,6 +371,24 @@ ERA / SCENARIO                         | AUTHORITY MODEL          | ATTACK RESUL
 2026 AI Agent Pipeline (Vulnerable)    | Ambient App Authority    | EXPLOITED   
 2026 AI Agent Pipeline (Mitigated)     | Scoped Session Token     | BLOCKED     
 ==============================================================================
+
+
+==============================================================================
+  SELF-AUDIT REGRESSIONS (V1.1)
+==============================================================================
+AUDIT REGRESSION                           | VULNERABILITY / BYPASS | RESULT      
+------------------------------------------------------------------------------
+Classic Path Traversal (x/../sysx_bill.log) | CWE-22 / CWE-59      | BLOCKED     
+  Detail: ACCESS DENIED: User 'alice' lacks authority to acquire a write capability for protected system file 'sysx_bill.log'.
+Agent Scope Mutation (allowed_actions.add) | Mutable Scope        | BLOCKED     
+  Detail: Scope immutable (frozenset): 'frozenset' object has no attribute 'add'
+Capability Retargeting (dataclasses.replace) | Public API Retarget  | BLOCKED     
+  Detail: Not a dataclass / retarget rejected (TypeError): replace() should be called on dataclass instances
+Authority Substitution (object.__new__)    | Slot Forgery Bypass  | BLOCKED     
+  Detail: Fabricated instance rejected at write time: FORGERY DETECTED: Capability write operation was not issued by CapabilityFactory.
+==============================================================================
+
+
 ```
 
 ---
@@ -246,6 +450,190 @@ Confirmações em linguagem natural são texto. A mesma carga de prompt injectio
 
 ---
 
+### Auditando minhas próprias mitigações (v1.1)
+
+#### Achados
+Uma auditoria técnica das mitigações da versão 1.0.0 identificou brechas de segurança nas camadas de mitigação:
+
+1. **Brecha 1: Path Traversal e Resolução de Symlinks em `classic_capability.CapabilityFactory` (CWE-22, CWE-59)**
+   A checagem de autorização comparava o caminho montado (`self.system_dir / relative_or_abs_path`) com `self.protected_files` sem canonicalização prévia (`Path.resolve()`). Um pedido de `alice` para `"x/../sysx_bill.log"` ou um link simbólico inocente apontando para `sysx_bill.log` contornava a checagem de pertinência, retornando uma `FileCapability` de escrita válida para o arquivo protegido de cobrança.
+
+2. **Brecha 2: Escopo Mutável em `agent_capability.AgentSessionCapability`**
+   A dataclass utilizava `@dataclass(frozen=True)`, porém os campos `allowed_actions` e `allowed_targets` foram inicializados com instâncias de `set` mutável. Invocar `cap.allowed_actions.add("delete_file")` alterava o conjunto diretamente em tempo de execução, ampliando o escopo sem disparar exceção.
+
+3. **Brecha 3: Retargeting de Capability via `dataclasses.replace` (Identificada na Rodada 2 da Auditoria)**
+   `FileCapability` verificava a marca da factory somente na construção. A função pública `dataclasses.replace` da biblioteca padrão copiava a marca válida permitindo alterar `target_path`. Uma capability legítima emitida para `alice` apontando para `alice_out.bin` podia ser redirecionada para `sysx_bill.log` sem importar símbolos privados, pois a autoridade não era verificada no momento do uso.
+
+4. **Brecha 4: Desempacotamento de Caracteres por String Pura em `AgentSessionCapability`**
+   Passar uma string isolada em vez de coleção para `allowed_actions` ou `allowed_targets` fazia com que `frozenset("summarize_doc")` fosse silenciosamente dividido em caracteres individuais (`{'s', 'u', 'm', ...}`). Itens não-string também eram aceitos sem validação.
+
+5. **Brecha 5: Substituição de Autoridade por Factory Falsa e Reuso de Endereço (Identificada na Rodada 3 da Auditoria)**
+   Na mitigação da Rodada 2, a checagem no momento do uso consultava `_factory` na própria capability por duck typing (`getattr(self, "_factory")`). Como `_factory` permaneceu campo de dataclass, `dataclasses.replace` permitia trocar caminho e factory na mesma chamada. Um invasor forneceu uma `FakeFactory` cujo método `is_valid_capability` sempre retornava verdadeiro, autorizando a escrita em `sysx_bill.log`. Além disso, rastrear capabilities emitidas por `id()` numérico no registro permitia que o reuso de endereços de memória do CPython após coleta de lixo validasse objetos não intencionais.
+
+6. **Brecha 6: Fabricação de Objeto e Prova de Teste Degenerada (Identificada na Rodada 4 da Auditoria)**
+   O teste de substituição de autoridade da Rodada 3 era degenerado: chamava `dataclasses.replace` primeiro, falhando no tipo da classe em vez de exercitar a substituição de autoridade, exibindo mensagem idêntica ao teste de retargeting. Ao separar os testes, construir uma instância via `object.__new__` e preencher os slots com `object.__setattr__` (incluindo uma operação de escrita escolhida pelo atacante) permitia escrita não autorizada. A verificação no momento do uso foi restabelecida sem duck typing: `write_text` valida que `_write_op` foi emitida pela `CapabilityFactory` (portando `_FACTORY_TOKEN`), e `_bound_write_op` valida por closure que a instância executante está ativa no registro `WeakSet` da factory. Instâncias fabricadas são rejeitadas com `PermissionDeniedError`.
+
+**Achados secundários**:
+- `FileCapability` podia ser instanciada diretamente sem passar pela `CapabilityFactory`, contradizendo docstrings que a classificavam como inforjável.
+- Parâmetro `executor_id` em `FileCapability.write_text` nunca era avaliado.
+- O motor vulnerável registrava `"ACTION EXECUTED: Custom action"` para ações desconhecidas sem executar operação real.
+- Mensagens de erro do validador utilizavam conjunto com ordem de iteração não determinística.
+- Imports não utilizados (`os` em `classic_deputy`, `sys` in `run_demo`, `typing.Set` em `agent_capability`).
+- Caminhos `/tmp` fixos impediam execução padronizada entre diferentes sistemas operacionais.
+
+#### Comandos de Reprodução
+
+**Brecha 1 (Path Traversal — CWE-22/59):**
+```bash
+python3 -c "
+from pathlib import Path
+import tempfile
+from src.classic_capability import CapabilityFactory, PermissionDeniedError
+d = Path(tempfile.gettempdir()) / 'audit_p1'
+d.mkdir(parents=True, exist_ok=True)
+b = d / 'sysx_bill.log'
+b.write_text('[ORIGINAL]', encoding='utf-8')
+f = CapabilityFactory(d)
+try:
+    f.request_write_capability('alice', 'x/../sysx_bill.log').write_text('[CORRUPTED]')
+    print('EXPLOITED: ' + b.read_text())
+except PermissionDeniedError as e:
+    print(f'BLOCKED: {e}')
+    print('Billing content: ' + b.read_text())
+"
+```
+*Saída na v1.1.0*:
+```
+BLOCKED: ACCESS DENIED: User 'alice' lacks authority to acquire a write capability for protected system file 'sysx_bill.log'.
+Billing content: [ORIGINAL]
+```
+*Comportamento na v1.0.0*: Na v1.0.0, a `CapabilityFactory` não canonicalizava caminhos antes de compará-los com `protected_files`. Solicitar uma capability para `'x/../sysx_bill.log'` contornava a checagem de proteção, retornando uma `FileCapability` válida que sobrescrevia o log de cobrança com `[CORRUPTED]`.
+
+**Brecha 2 (Mutação de Escopo — Coleção Mutável):**
+```bash
+python3 -c "
+from src.agent_capability import AgentSessionCapability
+c = AgentSessionCapability('s', allowed_actions={'summarize_doc'}, allowed_targets={'notes.txt'})
+try:
+    c.allowed_actions.add('delete_file')
+    print(f'EXPLOITED: scope mutated to {c.allowed_actions}')
+except AttributeError as e:
+    print(f'BLOCKED: {type(c.allowed_actions).__name__} is immutable ({e})')
+"
+```
+*Saída na v1.1.0*:
+```
+BLOCKED: frozenset is immutable ('frozenset' object has no attribute 'add')
+```
+*Comportamento na v1.0.0*: Na v1.0.0, o `AgentSessionCapability` armazenava `allowed_actions` como um `set` mutável. Invocar `c.allowed_actions.add('delete_file')` alterava o escopo diretamente sem erro, fazendo com que ações não autorizadas contornassem a validação.
+
+**Brecha 3 (Retargeting via dataclasses.replace — Rodada 2 da Auditoria):**
+```bash
+python3 -c "
+import dataclasses, tempfile
+from pathlib import Path
+from src.classic_capability import CapabilityFactory, PermissionDeniedError
+d = Path(tempfile.gettempdir()) / 'audit_p3'
+d.mkdir(parents=True, exist_ok=True)
+b = d / 'sysx_bill.log'
+b.write_text('[ORIGINAL]', encoding='utf-8')
+f = CapabilityFactory(d)
+c = f.request_write_capability('alice', 'alice.txt')
+try:
+    r = dataclasses.replace(c, target_path=b)
+    r.write_text('[CORRUPTED]')
+    print('EXPLOITED: ' + b.read_text())
+except (TypeError, PermissionDeniedError) as e:
+    print(f'BLOCKED: {type(e).__name__}: {e}')
+    print('Billing content: ' + b.read_text())
+"
+```
+*Saída na v1.1.0*:
+```
+BLOCKED: TypeError: replace() should be called on dataclass instances
+Billing content: [ORIGINAL]
+```
+*Comportamento na v1.0.0*: Na v1.0.0, `FileCapability` era uma dataclass e verificava a marca da factory somente na construção. Invocar `dataclasses.replace(c, target_path=b)` produzia uma nova capability apontando para `sysx_bill.log` que mantinha a marca válida da factory, permitindo que um usuário não privilegiado sobrescrevesse o log de cobrança.
+
+**Brecha 4 (Substituição de Autoridade via FakeFactory — Rodada 3 da Auditoria):**
+```bash
+python3 -c "
+import dataclasses, tempfile
+from pathlib import Path
+from src.classic_capability import CapabilityFactory, PermissionDeniedError
+d = Path(tempfile.gettempdir()) / 'audit_p4'
+d.mkdir(parents=True, exist_ok=True)
+b = d / 'sysx_bill.log'
+b.write_text('[ORIGINAL]', encoding='utf-8')
+f = CapabilityFactory(d)
+c = f.request_write_capability('alice', 'alice.txt')
+class FakeFactory:
+    def is_valid_capability(self, cap):
+        return True
+try:
+    r = dataclasses.replace(c, target_path=b, _factory=FakeFactory())
+    r.write_text('[CORRUPTED BY FAKE FACTORY]')
+    print('EXPLOITED: ' + b.read_text())
+except (TypeError, PermissionDeniedError, AttributeError) as e:
+    print(f'BLOCKED: {type(e).__name__}: {e}')
+    print('Billing content: ' + b.read_text())
+"
+```
+*Saída na v1.1.0*:
+```
+BLOCKED: TypeError: replace() should be called on dataclass instances
+Billing content: [ORIGINAL]
+```
+*Comportamento na Rodada 2 intermediária*: Na mitigação intermediária da Rodada 2, a autoridade era verificada no momento do uso consultando `_factory` na capability por duck typing. Como `_factory` era campo de dataclass, `dataclasses.replace` permitia trocar tanto `target_path` quanto `_factory` por uma `FakeFactory` controlada pelo invasor cujo método `is_valid_capability` sempre retornava `True`, sobrescrevendo o log de cobrança. Na v1.1.0, `FileCapability` não é dataclass, de modo que `replace()` falha imediatamente, mantendo o arquivo de cobrança intacto.
+
+**Brecha 5 (Fabricação de Slots via object.__new__ — Rodada 4 da Auditoria):**
+```bash
+python3 -c "
+import tempfile
+from pathlib import Path
+from src.classic_capability import FileCapability, PermissionDeniedError
+d = Path(tempfile.gettempdir()) / 'audit_p5'
+d.mkdir(parents=True, exist_ok=True)
+b = d / 'sysx_bill.log'
+b.write_text('[ORIGINAL]', encoding='utf-8')
+fake_cap = object.__new__(FileCapability)
+object.__setattr__(fake_cap, '_target_path', b)
+object.__setattr__(fake_cap, '_owner_id', 'alice')
+object.__setattr__(fake_cap, '_read_only', False)
+object.__setattr__(fake_cap, '_write_op', lambda *a, **k: b.write_text('[CORRUPTED BY FABRICATED CAPABILITY]', encoding='utf-8'))
+try:
+    fake_cap.write_text('[CORRUPTED]')
+    print('EXPLOITED: ' + b.read_text())
+except PermissionDeniedError as e:
+    print(f'BLOCKED: {e}')
+    print('Billing content: ' + b.read_text())
+"
+```
+*Saída na v1.1.0*:
+```
+BLOCKED: FORGERY DETECTED: Capability write operation was not issued by CapabilityFactory.
+Billing content: [ORIGINAL]
+```
+*Comportamento na Rodada 3 intermediária*: Na mitigação intermediária da Rodada 3, um invasor contornando o construtor por reflexão em Python (`object.__new__` e `object.__setattr__`) podia forjar uma capability com uma lambda arbitrária vinculada em `_write_op`. Na v1.1.0, `write_text` valida que `_write_op` porta o token sentinela privado da factory e valida por closure que a instância está ativa no registro `WeakSet` da factory. A capability forjada é rejeitada com `PermissionDeniedError`, preservando o log de cobrança intacto.
+
+#### Causa Raiz
+A mitigação caiu no mesmo erro que combatia: **a resolução de nome continuou separada da autoridade**. As duas primeiras tentativas de correção falharam porque tratavam sintomas, e a autoridade continuava sendo dado reescrevível em uma dataclass: enquanto a autoridade estiver representada como campos de dados, APIs públicas da biblioteca padrão (`dataclasses.replace`) podem desacoplar a autoridade do recurso designado. No caso do agente, a imutabilidade do container `@dataclass(frozen=True)` não se estendia aos objetos mutáveis armazenados nos campos.
+
+#### Correções (v1.1.0)
+- **Canonicalização e Contenção de Diretório (`classic_capability.py`)**: Todos os caminhos solicitados são canonicalizados via `Path.resolve()` antes da checagem. A contenção no diretório do sistema é verificada via `Path.relative_to()`. A comparação com `protected_files` ocorre sobre caminhos canonicalizados.
+- **Redesenho Fundamental e Verificação no Uso (`classic_capability.py`)**: `FileCapability` deixa de ser dataclass. Passa a ser classe comum com `__slots__` explícitos, propriedades somente leitura e cópias/serialização desabilitadas (`copy.copy`, `copy.deepcopy`, `pickle.dumps` levantam `TypeError`). A autoridade não é armazenada como campo de dados: no momento da emissão, a `CapabilityFactory` vincula a operação de escrita diretamente como closure privada (`_write_op`) ao caminho canônico. Instâncias ativas são rastreadas na `CapabilityFactory` via `weakref.WeakSet` por identidade real em vez de `id()` numérico. `write_text` valida que `_write_op` porta `_FACTORY_TOKEN`, e `_bound_write_op` verifica por closure se a instância executante está ativa no `WeakSet` da factory. As docstrings documentam a fronteira entre proteções contra APIs públicas e limites de reflexão em Python (Hardy 1988, Miller 2006), nomeando explicitamente `object.__new__` e `object.__setattr__` como contornos do construtor.
+- **Imutabilidade de Escopo e Validação Estrita de Tipos (`agent_capability.py`)**: `allowed_actions` e `allowed_targets` rejeitam strings puras e itens não-string com `TypeError` na construção, convertendo iteráveis válidos em instâncias de `frozenset`.
+- **Validação com Negação por Padrão (`agent_capability.py`)**: O `DeterministicCapabilityValidator` falha fechado: payloads com `action` ou `target` ausentes, `None` ou de tipo não-string levantam `CapabilityValidationError`. Mensagens de erro utilizam listas ordenadas para saída determinística.
+- **Limpezas Gerais**: Remoção de `executor_id`, substituição de literais `/tmp` por `tempfile.gettempdir()`, atualização de mensagens de log no agente vulnerável para refletir simulação de despacho ambiente, e remoção de imports não utilizados.
+
+#### Lição Central
+Um teste que passa pelo motivo errado é falsa confiança. A prova degenerada foi encontrada só porque a mensagem de duas regressões era idêntica. Na segurança baseada em capabilities autêntica, a autoridade é a própria referência inforjável para a operação, não um atributo mutável de dados avaliado contra tabelas ambientes ou validadores fornecidos pelo solicitante. Qualquer verificação de autoridade executada sobre nomes textuais antes da canonicalização ou sobre estruturas de dados mutáveis recria a vulnerabilidade do Confused Deputy.
+
+#### Contexto do Processo
+Brechas encontradas em revisão assistida por IA com aprovação humana direta de cada mudança ao longo de quatro rodadas de auditoria. A rodada 2 identificou o retargeting via `dataclasses.replace`, a rodada 3 identificou a substituição de autoridade por factory falsa e o reuso de endereço numérico, e a rodada 4 identificou provas de teste degeneradas e fabricação de slots via `object.__new__`.
+
+---
+
 ### Instruções de Instalação e Execução
 
 #### 1. Executar Demonstração (Sem Ambiente Virtual)
@@ -288,4 +676,19 @@ pytest -v
      - **LLM01:2025 — Prompt Injection** (Direct & Indirect prompt injection manipulation vectors).
      - **LLM05:2025 — Improper Output Handling** (Downstream systems consuming model outputs without deterministic authorization checks).
      - **LLM06:2025 — Excessive Agency** (Vulnerabilities arising when LLM outputs trigger privileged actions via broad ambient permissions).
+
+4. **MITRE Corporation** (2024). "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')".
+   - URL: [https://cwe.mitre.org/data/definitions/22.html](https://cwe.mitre.org/data/definitions/22.html)
+
+5. **MITRE Corporation** (2024). "CWE-59: Improper Link Resolution Before File Access ('Link Following')".
+   - URL: [https://cwe.mitre.org/data/definitions/59.html](https://cwe.mitre.org/data/definitions/59.html)
+
+6. **Python Software Foundation** (2024). "Python Standard Library Documentation: `pathlib.Path.resolve` and `pathlib.Path.relative_to`".
+   - URL: [https://docs.python.org/3/library/pathlib.html](https://docs.python.org/3/library/pathlib.html)
+
+7. **Python Software Foundation** (2024). "Python Standard Library Documentation: `dataclasses.dataclass(frozen=True)`".
+   - URL: [https://docs.python.org/3/library/dataclasses.html](https://docs.python.org/3/library/dataclasses.html)
+
+8. **Miller, Mark S.** (2006). "Robust Composition: Towards a Unified Approach to Access Control and Concurrency Control". *PhD thesis, Johns Hopkins University*.
+   - Canonical dissertation on the Object-Capability Model, reference mechanics, and the E programming language.
 

@@ -18,8 +18,8 @@ Historical Scenario:
 
 from dataclasses import dataclass
 from pathlib import Path
-import os
 import shutil
+import tempfile
 
 
 @dataclass
@@ -107,7 +107,7 @@ class ClassicVulnerableCompiler:
 def run_classic_deputy_demo(sandbox_dir: Path | None = None) -> CompilationResult:
     """Run the classic confused deputy demonstration."""
     if sandbox_dir is None:
-        sandbox_dir = Path("/tmp/confused_deputy_demo/classic_vulnerable")
+        sandbox_dir = Path(tempfile.gettempdir()) / "confused_deputy_demo" / "classic_vulnerable"
     
     if sandbox_dir.exists():
         shutil.rmtree(sandbox_dir)
