@@ -17,9 +17,9 @@ Mitigation Principles:
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Set
 import json
 import shutil
+import tempfile
 
 from src.agent_deputy import SimulatedLLMParser
 
@@ -36,8 +36,51 @@ class AgentSessionCapability:
     Defines a closed set of authorized actions and target paths.
     """
     session_id: str
-    allowed_actions: Set[str] = field(default_factory=lambda: {"summarize_doc"})
-    allowed_targets: Set[str] = field(default_factory=lambda: {"user_notes.txt"})
+    allowed_actions: frozenset[str] = field(default_factory=lambda: frozenset({"summarize_doc"}))
+    allowed_targets: frozenset[str] = field(default_factory=lambda: frozenset({"user_notes.txt"}))
+
+    def __post_init__(self) -> None:
+        # Reject raw strings or bytes (preventing silent conversion into character sets)
+        if isinstance(self.allowed_actions, (str, bytes)):
+            raise TypeError(
+                f"allowed_actions must be an iterable of strings, not a string: {self.allowed_actions!r}"
+            )
+        if isinstance(self.allowed_targets, (str, bytes)):
+            raise TypeError(
+                f"allowed_targets must be an iterable of strings, not a string: {self.allowed_targets!r}"
+            )
+
+        # Validate that allowed_actions is iterable and contains only strings
+        try:
+            actions_list = list(self.allowed_actions)
+        except TypeError:
+            raise TypeError(
+                f"allowed_actions must be an iterable of strings, got {type(self.allowed_actions).__name__}"
+            )
+        for item in actions_list:
+            if not isinstance(item, str):
+                raise TypeError(
+                    f"All items in allowed_actions must be strings, got {type(item).__name__}: {item!r}"
+                )
+
+        # Validate that allowed_targets is iterable and contains only strings
+        try:
+            targets_list = list(self.allowed_targets)
+        except TypeError:
+            raise TypeError(
+                f"allowed_targets must be an iterable of strings, got {type(self.allowed_targets).__name__}"
+            )
+        for item in targets_list:
+            if not isinstance(item, str):
+                raise TypeError(
+                    f"All items in allowed_targets must be strings, got {type(item).__name__}: {item!r}"
+                )
+
+        # Convert to immutable frozenset on construction
+        if not isinstance(self.allowed_actions, frozenset):
+            object.__setattr__(self, "allowed_actions", frozenset(actions_list))
+        if not isinstance(self.allowed_targets, frozenset):
+            object.__setattr__(self, "allowed_targets", frozenset(targets_list))
 
 
 class DeterministicCapabilityValidator:
@@ -48,27 +91,46 @@ class DeterministicCapabilityValidator:
     This gate does NOT ask the LLM for confirmation or justification.
     Natural language evaluation is vulnerable to prompt injection.
     Validation is 100% deterministic code matching against explicit capability tokens.
+    Fails closed (deny-by-default): action and target must both exist and be valid strings.
     """
 
     def validate_action(self, action_payload: dict, capability: AgentSessionCapability) -> None:
         """
         Validate proposed LLM action payload against explicit capability scope.
+        Fails closed (deny-by-default): action and target must be present and be strings.
+        Target comparison remains exact (no normalization).
         """
+        if not isinstance(action_payload, dict):
+            raise CapabilityValidationError(
+                f"SECURITY VIOLATION: Action payload must be a dictionary, got {type(action_payload).__name__}."
+            )
+
         action = action_payload.get("action")
         target = action_payload.get("target")
 
-        # Check 1: Action in allowed closed set
+        # Deny by default: action and target must exist and be strings
+        if not isinstance(action, str):
+            raise CapabilityValidationError(
+                f"SECURITY VIOLATION: Action must be a valid string, got {type(action).__name__}."
+            )
+
+        if not isinstance(target, str):
+            raise CapabilityValidationError(
+                f"SECURITY VIOLATION: Target must be a valid string, got {type(target).__name__}."
+            )
+
+        # Check 1: Action in allowed closed set (deterministic sorted list in message)
         if action not in capability.allowed_actions:
             raise CapabilityValidationError(
                 f"SECURITY VIOLATION: Action '{action}' is outside granted capability scope. "
-                f"Allowed actions: {capability.allowed_actions}"
+                f"Allowed actions: {sorted(capability.allowed_actions)}"
             )
 
-        # Check 2: Target in allowed closed targets set
+        # Check 2: Target in allowed closed targets set (exact match, deterministic sorted list)
         if target not in capability.allowed_targets:
             raise CapabilityValidationError(
                 f"SECURITY VIOLATION: Target '{target}' is outside granted capability scope. "
-                f"Allowed targets: {capability.allowed_targets}"
+                f"Allowed targets: {sorted(capability.allowed_targets)}"
             )
 
 
@@ -171,7 +233,7 @@ class MitigatedAgentEngine:
 def run_agent_capability_demo(sandbox_dir: Path | None = None) -> MitigatedAgentResult:
     """Run the mitigated AI agent capability demonstration."""
     if sandbox_dir is None:
-        sandbox_dir = Path("/tmp/confused_deputy_demo/agent_mitigated")
+        sandbox_dir = Path(tempfile.gettempdir()) / "confused_deputy_demo" / "agent_mitigated"
 
     if sandbox_dir.exists():
         shutil.rmtree(sandbox_dir)

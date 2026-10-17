@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import shutil
+import tempfile
 
 
 @dataclass
@@ -121,7 +122,10 @@ class VulnerableAgentEngine:
         elif action == "summarize_doc":
             self.logs.append(f"ACTION EXECUTED: Summarized doc '{target_name}'.")
         else:
-            self.logs.append(f"ACTION EXECUTED: Custom action '{action}' on '{target_name}'.")
+            self.logs.append(
+                f"AMBIENT DISPATCH SIMULATION: Action '{action}' on '{target_name}' "
+                f"would be dispatched generically under ambient application authority in a real system."
+            )
 
         db_destroyed = not self.db_path.exists()
         
@@ -137,7 +141,7 @@ class VulnerableAgentEngine:
 def run_agent_deputy_demo(sandbox_dir: Path | None = None) -> AgentExecutionResult:
     """Run the vulnerable AI agent confused deputy demonstration."""
     if sandbox_dir is None:
-        sandbox_dir = Path("/tmp/confused_deputy_demo/agent_vulnerable")
+        sandbox_dir = Path(tempfile.gettempdir()) / "confused_deputy_demo" / "agent_vulnerable"
 
     if sandbox_dir.exists():
         shutil.rmtree(sandbox_dir)

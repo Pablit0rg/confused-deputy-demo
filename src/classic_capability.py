@@ -17,7 +17,10 @@ Mitigation Principle:
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 import shutil
+import tempfile
+import weakref
 
 
 class PermissionDeniedError(PermissionError):
@@ -25,56 +28,192 @@ class PermissionDeniedError(PermissionError):
     pass
 
 
-@dataclass(frozen=True)
+# Module-private token used to mark legitimate factory issuance.
+_FACTORY_TOKEN = object()
+
+
 class FileCapability:
     """
-    An unforgeable capability token representing write access to a specific file.
-    
-    In a true capability OS, capabilities are held in protected C-lists (Capability Lists)
-    managed by the microkernel hardware/OS. Here, we model it as a capability object
-    bound to the owner's authority upon creation.
-    """
-    target_path: Path
-    owner_id: str
-    read_only: bool = False
+    A capability token representing authorized write access to a specific file.
 
-    def write_text(self, content: str, executor_id: str) -> None:
-        """Write content using the authority designated by this capability."""
-        if self.read_only:
+    In capability-based security (Dennis & Van Horn 1966, Hardy 1988), a capability
+    is not an inert data record of permissions evaluated against ambient tables;
+    it is the unforgeable reference to the resource operation itself.
+
+    Design details (v1.1.0 Round 3/4 redesign):
+    - NOT a dataclass: Eliminates vulnerability to standard library public copying APIs
+      (such as `dataclasses.replace`).
+    - Explicit `__slots__`: Prevents dynamic attribute injection, modification, or dictionary tampering.
+    - Bound execution authority: The capability holds a private, callable write operation
+      (`_write_op`) bound directly to the canonical target path and owner at the moment of
+      issuance inside `CapabilityFactory`. The capability does not store an external factory reference
+      nor does it perform duck-typed delegation to any caller-supplied validator.
+    - Time-of-use verification: The bound write operation verifies that the executing capability
+      instance remains active in the issuing factory's internal `WeakSet` registry.
+    - Immutable properties: `target_path`, `owner_id`, and `read_only` are read-only properties.
+      Attribute assignment raises `AttributeError`.
+    - Non-copyable and non-serializable: `__copy__`, `__deepcopy__`, and `__reduce__` raise `TypeError`
+      to prevent object duplication via standard library serialization or copying tools.
+    - Construction restriction: Construction via `__init__` requires the module-private `_FACTORY_TOKEN`
+      and a valid bound write operation from `CapabilityFactory`. Direct construction without
+      these raises `PermissionDeniedError`.
+
+    What this design prevents:
+    - Retargeting via `dataclasses.replace`: `FileCapability` is not a dataclass, raising `TypeError`.
+    - Authority substitution: No `_factory` field or duck-typed authority checking exists.
+      The write operation is fixed to the canonical path and owner determined at issuance, and
+      consults the issuing factory's internal registry at write time.
+    - Object duplication via `copy.copy`, `copy.deepcopy`, or `pickle.dumps`: All raise `TypeError`.
+    - Direct instantiation via `__init__`: Direct construction without `_FACTORY_TOKEN` raises `PermissionDeniedError`.
+
+    What Python still cannot prevent:
+    - In-process memory reflection and interpreter builtins: Any code running in the same Python
+      interpreter process can bypass constructors using `object.__new__`, manipulate attributes
+      using `object.__setattr__`, inspect closures via `__closure__`, manipulate bytecode, or use
+      `ctypes`/`gc` to inspect and modify interpreter state. True unforgeability requires an
+      operating system with microkernel capability lists (C-lists) or an object-capability
+      programming language.
+    """
+
+    __slots__ = ("_target_path", "_owner_id", "_read_only", "_write_op", "__weakref__")
+
+    def __init__(
+        self,
+        target_path: Path,
+        owner_id: str,
+        read_only: bool = False,
+        *,
+        _token: object = None,
+        _write_op: Callable[..., None] | None = None,
+    ) -> None:
+        if _token is not _FACTORY_TOKEN or _write_op is None:
             raise PermissionDeniedError(
-                f"Capability for '{self.target_path}' is read-only."
+                "FORGERY DETECTED: FileCapability instances cannot be constructed directly. "
+                "Capabilities must be acquired through CapabilityFactory."
             )
-        self.target_path.write_text(content, encoding="utf-8")
+        object.__setattr__(self, "_target_path", target_path)
+        object.__setattr__(self, "_owner_id", owner_id)
+        object.__setattr__(self, "_read_only", read_only)
+        object.__setattr__(self, "_write_op", _write_op)
+
+    @property
+    def target_path(self) -> Path:
+        return self._target_path
+
+    @property
+    def owner_id(self) -> str:
+        return self._owner_id
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    def write_text(self, content: str) -> None:
+        """Write content using the authority designated by this capability."""
+        if self._read_only:
+            raise PermissionDeniedError(
+                f"Capability for '{self._target_path}' is read-only."
+            )
+        # Verify that _write_op is a legitimate factory-bound operation
+        if not callable(self._write_op) or getattr(self._write_op, "_token", None) is not _FACTORY_TOKEN:
+            raise PermissionDeniedError(
+                "FORGERY DETECTED: Capability write operation was not issued by CapabilityFactory."
+            )
+        self._write_op(self, content)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"FileCapability is immutable; cannot modify attribute '{name}'.")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"FileCapability is immutable; cannot delete attribute '{name}'.")
+
+    def __copy__(self) -> "FileCapability":
+        raise TypeError("FileCapability cannot be copied.")
+
+    def __deepcopy__(self, memo: dict) -> "FileCapability":
+        raise TypeError("FileCapability cannot be deep-copied.")
+
+    def __reduce__(self) -> None:
+        raise TypeError("FileCapability cannot be serialized or pickled.")
+
+    def __repr__(self) -> str:
+        return (
+            f"FileCapability(target_path={self._target_path!r}, "
+            f"owner_id={self._owner_id!r}, read_only={self._read_only!r})"
+        )
 
 
 class CapabilityFactory:
     """
     Simulates the OS Capability Authority / Directory Manager.
     Enforces that users can only receive capabilities for resources they own
-    or are explicitly granted access to.
+    or are explicitly granted access to, and binds write authority directly
+    to the issued capability.
     """
 
     def __init__(self, system_dir: Path):
-        self.system_dir = system_dir
-        # System-protected files where only 'sys_admin' has write authority
-        self.protected_files = {self.system_dir / "sysx_bill.log"}
+        self.system_dir = system_dir.resolve()
+        # System-protected files where only 'sys_admin' has write authority (canonicalized)
+        self.protected_files = {(self.system_dir / "sysx_bill.log").resolve()}
+        # WeakSet tracking legitimately issued active capabilities by real object identity
+        self._issued_capabilities: weakref.WeakSet[FileCapability] = weakref.WeakSet()
+
+    def is_valid_capability(self, cap: FileCapability) -> bool:
+        """
+        Verify that the capability was legitimately issued by this factory
+        and remains active, tracked by real object identity (WeakSet).
+        """
+        return cap in self._issued_capabilities
 
     def request_write_capability(self, caller_id: str, relative_or_abs_path: str) -> FileCapability:
         """
         Request a write capability for a given file path on behalf of caller_id.
+        Enforces path canonicalization (CWE-22, CWE-59) and directory containment
+        before checking authorization, and binds the write operation directly to
+        the canonical path.
         """
         target_path = Path(relative_or_abs_path)
         if not target_path.is_absolute():
             target_path = self.system_dir / target_path
 
-        # Check authorization at capability creation time under caller_id's authority
-        if target_path in self.protected_files and caller_id != "sys_admin":
+        # Canonicalize path: resolves '..', symlinks, and absolute path
+        canonical_target = target_path.resolve()
+
+        # Enforce directory containment: canonical target must be inside system_dir (CWE-22)
+        try:
+            canonical_target.relative_to(self.system_dir)
+        except ValueError:
             raise PermissionDeniedError(
-                f"ACCESS DENIED: User '{caller_id}' lacks authority to acquire "
-                f"a write capability for protected system file '{target_path.name}'."
+                f"ACCESS DENIED: Path '{relative_or_abs_path}' resolves outside the allowed system directory."
             )
 
-        return FileCapability(target_path=target_path, owner_id=caller_id, read_only=False)
+        # Check authorization against canonical protected files (CWE-22, CWE-59)
+        if canonical_target in self.protected_files and caller_id != "sys_admin":
+            raise PermissionDeniedError(
+                f"ACCESS DENIED: User '{caller_id}' lacks authority to acquire "
+                f"a write capability for protected system file '{canonical_target.name}'."
+            )
+
+        # The write operation is bound to the exact canonical path verified under caller_id's authority.
+        # Authority is not a mutable field: it is the callable itself.
+        def _bound_write_op(instance: FileCapability, content: str) -> None:
+            if not self.is_valid_capability(instance):
+                raise PermissionDeniedError(
+                    "ACCESS DENIED: Capability is not registered with the issuing factory."
+                )
+            canonical_target.write_text(content, encoding="utf-8")
+
+        _bound_write_op._token = _FACTORY_TOKEN  # type: ignore[attr-defined]
+
+        cap = FileCapability(
+            target_path=canonical_target,
+            owner_id=caller_id,
+            read_only=False,
+            _token=_FACTORY_TOKEN,
+            _write_op=_bound_write_op,
+        )
+        self._issued_capabilities.add(cap)
+        return cap
 
 
 @dataclass
@@ -112,12 +251,12 @@ class ClassicCapabilityCompiler:
         compiled_binary = f"[COMPILED BINARY FROM {caller_id.upper()}]\n{source_code.upper()}\n[END BINARY]\n"
 
         # 2. Write output file USING THE CALLER-PROVIDED CAPABILITY (not ambient authority)
-        output_cap.write_text(compiled_binary, executor_id=caller_id)
+        output_cap.write_text(compiled_binary)
 
         # 3. Append usage charge using system internal capability
         current_log = self.system_billing_cap.target_path.read_text(encoding="utf-8")
         updated_log = current_log + f"RECORD 003: USER {caller_id} | CPU SEC: 1.0 | FEE: $0.10\n"
-        self.system_billing_cap.write_text(updated_log, executor_id="sys_admin")
+        self.system_billing_cap.write_text(updated_log)
 
         billing_content = self.system_billing_cap.target_path.read_text(encoding="utf-8")
         corrupted = "[SYSTEM BILLING LOG (SYSX)BILL - CONFIDENTIAL]" not in billing_content
@@ -139,7 +278,7 @@ class ClassicCapabilityCompiler:
 def run_classic_capability_demo(sandbox_dir: Path | None = None) -> dict:
     """Run the classic capability mitigation demonstration."""
     if sandbox_dir is None:
-        sandbox_dir = Path("/tmp/confused_deputy_demo/classic_capability")
+        sandbox_dir = Path(tempfile.gettempdir()) / "confused_deputy_demo" / "classic_capability"
 
     if sandbox_dir.exists():
         shutil.rmtree(sandbox_dir)
