@@ -13,7 +13,7 @@ In the late 1970s at Tymshare, a Fortran compiler (`(SYSX)FORT`) ran on a PDP-10
 
 However, the system billing file `(SYSX)BILL` was also stored in directory `SYSX`. Access to the billing file was an unintended collateral consequence of the broad license scope — a classic historical manifestation of **Excessive Agency** (OWASP `LLM06:2025`).
 
-When invoked, the compiler accepted an optional filename parameter from the user for **optional debugging output**. A user discovered the name `(SYSX)BILL` and supplied it as the debugging output destination. The compiler opened `(SYSX)BILL` using its home files license authority and overwritten the billing log with debugging text.
+When invoked, the compiler accepted an optional filename parameter from the user for **optional debugging output**. A user discovered the name `(SYSX)BILL` and supplied it as the debugging output destination. The compiler opened `(SYSX)BILL` using its home files license authority and overwrote the billing log with debugging text.
 
 No system access control permissions were violated. The system operated exactly as configured. The compiler acted as a **confused deputy**: a privileged program induced into abusing its own legitimate authority because it resolved a raw name using ambient privileges rather than enforcing caller authorization.
 
@@ -182,7 +182,9 @@ Billing content: [ORIGINAL]
 ```
 *v1.0.0 behavior*: In v1.0.0, `FileCapability` was a dataclass that checked the factory brand only upon construction. Calling `dataclasses.replace(c, target_path=b)` created a retargeted capability with the valid brand intact, allowing unprivileged write access to `sysx_bill.log`.
 
-**Breach 4 (Authority Substitution via FakeFactory — Round 3 Audit):**
+**Breach 4 (Character Unpacking on Raw Strings):** covered by `test_agent_capability_rejects_raw_string_and_non_string_items` in `tests/test_mitigation_bypasses.py`.
+
+**Breach 5 (Authority Substitution via FakeFactory — Round 3 Audit):**
 ```bash
 python3 -c "
 import dataclasses, tempfile
@@ -213,7 +215,7 @@ Billing content: [ORIGINAL]
 ```
 *Intermediate Round 2 behavior*: In the Round 2 mitigation, authority was verified at use time by querying `_factory` on the capability via duck typing. Because `_factory` was a dataclass field, `dataclasses.replace` could swap both `target_path` and `_factory` with a `FakeFactory` whose `is_valid_capability` always returned `True`, overwriting the billing log. In v1.1.0, `FileCapability` is not a dataclass, so `replace()` fails immediately, leaving the billing log intact.
 
-**Breach 5 (Slot Fabrication via object.__new__ — Round 4 Audit):**
+**Breach 6 (Slot Fabrication via object.__new__ — Round 4 Audit):**
 ```bash
 python3 -c "
 import tempfile
@@ -555,7 +557,9 @@ Billing content: [ORIGINAL]
 ```
 *Comportamento na v1.0.0*: Na v1.0.0, `FileCapability` era uma dataclass e verificava a marca da factory somente na construção. Invocar `dataclasses.replace(c, target_path=b)` produzia uma nova capability apontando para `sysx_bill.log` que mantinha a marca válida da factory, permitindo que um usuário não privilegiado sobrescrevesse o log de cobrança.
 
-**Brecha 4 (Substituição de Autoridade via FakeFactory — Rodada 3 da Auditoria):**
+**Brecha 4 (Desempacotamento de Caracteres por String Pura):** coberta por `test_agent_capability_rejects_raw_string_and_non_string_items` em `tests/test_mitigation_bypasses.py`.
+
+**Brecha 5 (Substituição de Autoridade via FakeFactory — Rodada 3 da Auditoria):**
 ```bash
 python3 -c "
 import dataclasses, tempfile
@@ -586,7 +590,7 @@ Billing content: [ORIGINAL]
 ```
 *Comportamento na Rodada 2 intermediária*: Na mitigação intermediária da Rodada 2, a autoridade era verificada no momento do uso consultando `_factory` na capability por duck typing. Como `_factory` era campo de dataclass, `dataclasses.replace` permitia trocar tanto `target_path` quanto `_factory` por uma `FakeFactory` controlada pelo invasor cujo método `is_valid_capability` sempre retornava `True`, sobrescrevendo o log de cobrança. Na v1.1.0, `FileCapability` não é dataclass, de modo que `replace()` falha imediatamente, mantendo o arquivo de cobrança intacto.
 
-**Brecha 5 (Fabricação de Slots via object.__new__ — Rodada 4 da Auditoria):**
+**Brecha 6 (Fabricação de Slots via object.__new__ — Rodada 4 da Auditoria):**
 ```bash
 python3 -c "
 import tempfile
@@ -691,4 +695,3 @@ pytest -v
 
 8. **Miller, Mark S.** (2006). "Robust Composition: Towards a Unified Approach to Access Control and Concurrency Control". *PhD thesis, Johns Hopkins University*.
    - Canonical dissertation on the Object-Capability Model, reference mechanics, and the E programming language.
-
