@@ -1,0 +1,4 @@
+# Dependencias exclusivas do experimento da Issue #4 (isoladas do nucleo stdlib da demo)
+openai>=2.38.0
+anthropic>=0.105.0
+httpx>=0.28.0
