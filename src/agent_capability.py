@@ -94,11 +94,33 @@ class DeterministicCapabilityValidator:
     Fails closed (deny-by-default): action and target must both exist and be valid strings.
     """
 
-    def validate_action(self, action_payload: dict, capability: AgentSessionCapability) -> None:
+    def validate_action(
+        self,
+        action_payload: dict,
+        capability: AgentSessionCapability,
+        workspace: Path,
+    ) -> Path:
         """
         Validate proposed LLM action payload against explicit capability scope.
         Fails closed (deny-by-default): action and target must be present and be strings.
-        Target comparison remains exact (no normalization).
+
+        A target NAME is not the resource the executor will touch: a symlink
+        named like an allowed target resolves to a different file. The target
+        is resolved with the same canonicalization the classic capability uses
+        (Path.resolve(), which follows symbolic links) and the FINAL resource
+        is validated: it must stay inside the workspace and still carry an
+        allowed name. The resolved resource is returned so the executor acts
+        on the sealed target instead of the raw payload name.
+
+        ``workspace`` is required: a caller that omits it would otherwise get
+        the weaker name-only check with no signal, so the gate refuses to run
+        without it.
+
+        Residual TOCTOU: the path is resolved at validation time, and the link
+        can be swapped before the executor opens it. For this demo the
+        executor only logs, so the window has no effect, but the classic
+        capability avoids the race entirely by holding an open file
+        descriptor.
         """
         if not isinstance(action_payload, dict):
             raise CapabilityValidationError(
@@ -132,6 +154,22 @@ class DeterministicCapabilityValidator:
                 f"SECURITY VIOLATION: Target '{target}' is outside granted capability scope. "
                 f"Allowed targets: {sorted(capability.allowed_targets)}"
             )
+
+        # Check 3: the gate approves the RESOLVED resource, not its name.
+        resolved = (workspace / target).resolve()
+        try:
+            resolved.relative_to(workspace.resolve())
+        except ValueError:
+            raise CapabilityValidationError(
+                f"SECURITY VIOLATION: Target '{target}' resolves outside the workspace."
+            ) from None
+        if resolved.name not in capability.allowed_targets:
+            raise CapabilityValidationError(
+                f"SECURITY VIOLATION: Target '{target}' resolves to '{resolved.name}', "
+                f"which is outside granted capability scope. "
+                f"Allowed targets: {sorted(capability.allowed_targets)}"
+            )
+        return resolved
 
 
 class NaiveLLMConfirmationEngine:
@@ -205,14 +243,18 @@ class MitigatedAgentEngine:
         attack_blocked = False
         block_reason = ""
         try:
-            self.validator.validate_action(action_payload, capability)
+            # The gate hands back the sealed, already-validated resource: the
+            # executor never touches the payload's raw name again.
+            sealed = self.validator.validate_action(
+                action_payload, capability, workspace=self.workspace_dir
+            )
             self.logs.append("Capability Validation PASSED: Action authorized.")
             
             # Execute allowed action
             action = action_payload.get("action")
-            target = action_payload.get("target", "")
             if action == "summarize_doc":
-                self.logs.append(f"ACTION EXECUTED: Summarized document '{target}'.")
+                resource = sealed.name
+                self.logs.append(f"ACTION EXECUTED: Summarized document '{resource}'.")
         except CapabilityValidationError as e:
             attack_blocked = True
             block_reason = str(e)

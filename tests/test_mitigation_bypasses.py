@@ -19,6 +19,7 @@ from src.agent_capability import (
     AgentSessionCapability,
     DeterministicCapabilityValidator,
     CapabilityValidationError,
+    MitigatedAgentEngine,
 )
 
 
@@ -284,7 +285,7 @@ def test_file_capability_legitimate_path_succeeds(tmp_path: Path) -> None:
         {"action": {"nested": "action"}, "target": "user_notes.txt"},  # unhashable dict action
     ],
 )
-def test_validator_denies_invalid_payload_by_default(invalid_payload: dict) -> None:
+def test_validator_denies_invalid_payload_by_default(invalid_payload: dict, tmp_path: Path) -> None:
     """
     Deterministic gate: Deny by default.
     LLM payload with missing, None, or non-string action/target must be rejected
@@ -297,4 +298,106 @@ def test_validator_denies_invalid_payload_by_default(invalid_payload: dict) -> N
         allowed_targets={"user_notes.txt"},
     )
     with pytest.raises(CapabilityValidationError):
-        validator.validate_action(invalid_payload, cap)
+        validator.validate_action(invalid_payload, cap, workspace=tmp_path)
+
+
+def test_symlinked_target_resolves_before_approval(tmp_path: Path) -> None:
+    """
+    A symlink named like an allowed target must not pass the gate on its name:
+    the validator resolves the target (same canonicalization as
+    classic_capability) and validates the final resource, and the engine
+    executes the sealed resource instead of the raw payload name.
+    """
+    validator = DeterministicCapabilityValidator()
+    cap = AgentSessionCapability(
+        session_id="session_symlink",
+        allowed_actions={"summarize_doc"},
+        allowed_targets={"user_notes.txt"},
+    )
+    payload = {"action": "summarize_doc", "target": "user_notes.txt"}
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "user_notes.txt").write_text("Meeting notes from Monday.", encoding="utf-8")
+    (workspace / "production_database.db").write_text("CONFIDENTIAL", encoding="utf-8")
+    sealed = validator.validate_action(dict(payload), cap, workspace=workspace)
+    assert sealed == (workspace / "user_notes.txt").resolve()
+
+    link = workspace / "user_notes.txt"
+    link.unlink()
+    try:
+        link.symlink_to(workspace / "production_database.db")
+    except OSError:
+        pytest.skip("symlink creation is not permitted on this host")
+    with pytest.raises(CapabilityValidationError, match="resolves to 'production_database.db'"):
+        validator.validate_action(dict(payload), cap, workspace=workspace)
+
+    # A link that escapes the workspace is denied even though the resolved
+    # name would match an allowed target.
+    outside = tmp_path / "outside" / "user_notes.txt"
+    outside.parent.mkdir()
+    outside.write_text("elsewhere", encoding="utf-8")
+    link.unlink()
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is not permitted on this host")
+    with pytest.raises(CapabilityValidationError, match="outside the workspace"):
+        validator.validate_action(dict(payload), cap, workspace=workspace)
+
+
+def test_engine_executes_the_sealed_resource(tmp_path: Path) -> None:
+    """
+    The executor no longer reads the payload's raw name: the validated resource
+    returned by the gate is what the action names, and a symlinked name is
+    blocked before any effect.
+    """
+    from src.agent_deputy import SimulatedLLMParser
+
+    engine = MitigatedAgentEngine(workspace_dir=tmp_path)
+    cap = AgentSessionCapability(
+        session_id="session_sealed",
+        allowed_actions={"summarize_doc"},
+        allowed_targets={"user_notes.txt"},
+    )
+    benign = "Please summarize user_notes.txt."
+    result = engine.execute_pipeline(
+        user_input_text=benign, llm_parser=SimulatedLLMParser(), capability=cap
+    )
+    assert result.attack_blocked is False
+    assert any(
+        "ACTION EXECUTED: Summarized document 'user_notes.txt'." in line for line in result.logs
+    )
+
+
+def test_engine_blocks_symlinked_name_before_any_effect(tmp_path: Path) -> None:
+    """
+    Through the engine: when the allowed name is a symlink to a resource the
+    capability never granted, the resolved-resource gate blocks it and no
+    ACTION EXECUTED log line is ever emitted.
+    """
+    from src.agent_deputy import SimulatedLLMParser
+
+    engine = MitigatedAgentEngine(workspace_dir=tmp_path)
+    cap = AgentSessionCapability(
+        session_id="session_symlink_engine",
+        allowed_actions={"summarize_doc"},
+        allowed_targets={"user_notes.txt"},
+    )
+
+    # Swap the benign name for a symlink pointing at the production database.
+    link = engine.workspace_dir / "user_notes.txt"
+    link.unlink()
+    try:
+        link.symlink_to(engine.db_path)
+    except OSError:
+        pytest.skip("symlink creation is not permitted on this host")
+
+    result = engine.execute_pipeline(
+        user_input_text="Please summarize user_notes.txt.",
+        llm_parser=SimulatedLLMParser(),
+        capability=cap,
+    )
+    assert result.attack_blocked is True
+    assert not any("ACTION EXECUTED" in line for line in result.logs)
+    assert engine.db_path.exists()

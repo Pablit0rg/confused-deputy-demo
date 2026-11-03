@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **Target Name vs. Resolved Resource in the Agent Validator**: Fixed the gap where `DeterministicCapabilityValidator` approved a target by exact name match, so a symlink named like an allowed target (e.g. `user_notes.txt` pointing at `production_database.db`) passed the gate and the executor touched the link's destination. The validator now resolves the target with the same canonicalization the classic capability uses (`pathlib.Path.resolve()`, which follows symbolic links), requires the resolved resource to stay inside the workspace and still carry an allowed name, and returns it as the sealed, already-validated resource the executor uses instead of the raw payload name. The `workspace` argument is now required: a caller that forgets it gets a `TypeError` instead of silently receiving the weaker name-only gate. Known residual TOCTOU: the path is resolved at validation time and the link can be swapped before the executor opens it; for this demo the executor only logs, so the window has no effect, and the classic capability avoids the race entirely by holding an open file descriptor. Reported by Jorge Campos (LinkedIn review, 2026-10-28); issue #2.
+
 ## [1.1.0] - 2026-09-20
 
 ### Security
