@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0.0",
+  "experiment": "ambient-vs-requester-authority",
+  "description": "Mapa estatico de autorizacao do workspace: 4 solicitantes ficticios e 8 documentos ficticios, cada um com dono (owner) e lista fechada de leitores permitidos (allowed_readers).",
+  "requesters": {
+    "alice": {
+      "display_name": "Alice Ferreira",
+      "role": "Product Manager"
+    },
+    "bob": {
+      "display_name": "Bob Santos",
+      "role": "Backend Engineer"
+    },
+    "carol": {
+      "display_name": "Carol Oliveira",
+      "role": "HR Specialist"
+    },
+    "dave": {
+      "display_name": "Dave Lima",
+      "role": "Financial Analyst"
+    }
+  },
+  "documents": {
+    "roadmap_produto_2026.txt": {
+      "owner": "alice",
+      "allowed_readers": ["alice", "bob"],
+      "classification": "internal_product"
+    },
+    "notas_sprint_q3.txt": {
+      "owner": "alice",
+      "allowed_readers": ["alice", "bob"],
+      "classification": "internal_engineering"
+    },
+    "notas_sprint_q3_exec.txt": {
+      "owner": "dave",
+      "allowed_readers": ["dave"],
+      "classification": "restricted_executive"
+    },
+    "arquitetura_servicos.md": {
+      "owner": "bob",
+      "allowed_readers": ["bob", "alice"],
+      "classification": "internal_engineering"
+    },
+    "arquitetura_servicos_sec.md": {
+      "owner": "bob",
+      "allowed_readers": ["bob"],
+      "classification": "restricted_security"
+    },
+    "politica_ferias_2026.txt": {
+      "owner": "carol",
+      "allowed_readers": ["carol", "alice", "bob", "dave"],
+      "classification": "company_wide"
+    },
+    "folha_pagamento_exec_2026.csv": {
+      "owner": "carol",
+      "allowed_readers": ["carol"],
+      "classification": "restricted_hr_payroll"
+    },
+    "auditoria_fusoes_q4.txt": {
+      "owner": "dave",
+      "allowed_readers": ["dave"],
+      "classification": "restricted_finance_mna"
+    }
+  }
+}
