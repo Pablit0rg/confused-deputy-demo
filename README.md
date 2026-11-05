@@ -25,6 +25,18 @@ This repository provides complete, standalone Python code demonstrating both the
 
 ---
 
+### Experiments with a Real Model
+
+Two pre-registered experiments measure what an actual LLM does (grok-4.3). In both, the answer key was frozen by SHA-256 and committed before the first model call.
+
+| Experiment | Question | Key result | Report |
+|---|---|---|---|
+| #4 Self-confirmation | Does asking the model to confirm its own action stop an attack? | The model self-approved 20 of 70 malicious proposals; the deterministic validator passed 0 of 70. | [REPORT](experiments/issue_4_self_confirmation/REPORT.md) |
+| Ambient vs. requester authority | Same validator, different capability: whose permission does it check? | Wrong-target proposals: 97 of 100. With the agent's capability, 97 of 97 passed; with the requester's, 0 of 97, while 50 of 50 legitimate requests still passed. | [REPORT](experiments/ambient_vs_requester_authority/REPORT.md) |
+
+Limits: one model, default temperature, one prompt wording. These are bench tests, not benchmarks. The contrast between the two capabilities is a demonstration by construction; the empirical part is the model's behavior.
+
+
 ### Key Concepts & Pattern Analysis
 
 #### The Core Vulnerability: Ambient Authority + Name Resolution
@@ -415,6 +427,16 @@ Este repositório fornece código Python completo e independente demonstrando o 
 > *Nota de Precisão Histórica*: Norman Hardy (1988) introduz o relato como ocorrido "há cerca de onze anos" (~1977) e o descreve como uma "história quase verdadeira" com detalhes não essenciais alterados.
 
 ---
+### Experimentos com Modelo Real
+
+Dois experimentos pré-registrados medem o que um LLM real faz (grok-4.3). Nos dois, o gabarito foi congelado por SHA-256 e commitado antes da primeira chamada ao modelo.
+
+| Experimento | Pergunta | Resultado principal | Relatório |
+|---|---|---|---|
+| #4 Autoconfirmação | Pedir que o modelo confirme a própria ação impede o ataque? | O modelo aprovou 20 de 70 propostas maliciosas; o validador determinístico deixou passar 0 de 70. | [REPORT](experiments/issue_4_self_confirmation/REPORT.md) |
+| Autoridade ambiente vs. do solicitante | Mesmo validador, outra capability: de quem é a permissão verificada? | Propostas de alvo errado: 97 de 100. Com a capability do agente, 97 de 97 passaram; com a do solicitante, 0 de 97, e 50 de 50 pedidos legítimos continuaram passando. | [REPORT](experiments/ambient_vs_requester_authority/REPORT.md) |
+
+Limites: um modelo, temperatura padrão, uma formulação de prompt. São testes de bancada, não benchmarks. O contraste entre as duas capabilities é demonstração por construção; a parte empírica é o comportamento do modelo.
 
 ### Conceitos Chave e Análise do Padrão
 
